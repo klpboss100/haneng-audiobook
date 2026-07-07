@@ -3,7 +3,7 @@
 ─────────────────────────────────────────
 실행: python -m streamlit run haneng.py
 ─────────────────────────────────────────
-한국어 소설 → 문학적 영어 번역 → 한국어/영어 MP3 오디오북 동시 제작
+한국어 소설 → 화자(M/W) 태그 → 문학적 영어 번역(화자 유지) → 한국어/영어 MP3 동시 제작
 """
 
 import streamlit as st
@@ -55,54 +55,158 @@ def save_config(data: dict):
 
 
 # ═══════════════════════════════════════════
-# 번역
+# 화자(M/W) 태그 변환 — 감정 태그 없음
 # ═══════════════════════════════════════════
-TRANSLATE_PROMPT = """당신은 한국 문학을 영어로 옮기는 전문 문학 번역가입니다.
-아래 한국어 소설 원고를 자연스럽고 문학적인 영어(literary English prose)로 번역하세요.
+TAG_PROMPT = """당신은 한국 소설 원고에 화자 태그를 추가하는 전문가입니다.
+
+## 절대 규칙
+- 원고 텍스트를 절대 수정·요약·생략하지 마세요
+- 원고 내용 전체를 빠짐없이 출력하세요
+- 태그만 각 줄 앞에 추가하세요
+
+## 태그 형식
+[화자] 텍스트   (예: [M] 그는 조용히 웃었다.)
+
+## 화자 종류 (이 두 가지만 사용, 감정 태그는 절대 사용 금지)
+- [M] : 내레이션(지문·묘사) + 모든 남자 대화
+- [W] : 모든 여자 대화
+
+## 처리 방법
+1. 챕터 제목 → [M]
+2. 내레이션·지문·묘사 → [M]
+3. 대화문("...") → 앞뒤 문맥으로 화자 성별 판단 (여자=[W], 남자/중성/불명=[M])
+4. 내레이션과 대화가 섞인 문단 → 반드시 줄 단위로 분리
+
+지금 바로 아래 원고 전체에 화자 태그를 추가하세요:
+
+{manuscript}"""
+
+
+def convert_tags(api_key: str, manuscript: str, model: str) -> str:
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model,
+        contents=TAG_PROMPT.format(manuscript=manuscript)
+    )
+    text = response.text
+    text = re.sub(r"```[a-z]*\n?", "", text).strip()
+    return text
+
+
+def parse_tagged_script(text: str):
+    lines = []
+    tag_pattern = re.compile(r'^\[([MW])\]\s*(.+)$')
+    for raw_line in text.split('\n'):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        m = tag_pattern.match(stripped)
+        if m:
+            speaker, content = m.groups()
+            lines.append({'speaker': speaker, 'text': content.strip()})
+    return lines
+
+
+def group_into_segments(lines):
+    """연속된 같은 화자 줄을 하나의 세그먼트로 묶음"""
+    if not lines:
+        return []
+    segments = []
+    cur_spk = lines[0]['speaker']
+    cur_lines = [lines[0]]
+    for line in lines[1:]:
+        if line['speaker'] == cur_spk:
+            cur_lines.append(line)
+        else:
+            segments.append({'speaker': cur_spk, 'lines': cur_lines})
+            cur_spk = line['speaker']
+            cur_lines = [line]
+    segments.append({'speaker': cur_spk, 'lines': cur_lines})
+    return segments
+
+
+def get_voice_for_speaker(spk: str, voices: dict) -> str:
+    return voices.get(spk, voices.get('M'))
+
+
+def merge_segments_by_voice(segs, voices):
+    """같은 목소리로 연결되는 연속 세그먼트 병합 → API 호출 감소"""
+    if not segs:
+        return []
+    merged = []
+    for seg in segs:
+        voice = get_voice_for_speaker(seg['speaker'], voices)
+        if merged and get_voice_for_speaker(merged[-1]['speaker'], voices) == voice:
+            merged[-1]['lines'].extend(seg['lines'])
+        else:
+            merged.append({'speaker': seg['speaker'], 'lines': list(seg['lines'])})
+    return merged
+
+
+def chunk_segment_lines(lines, max_chars: int):
+    chunks, current, current_len = [], [], 0
+    for line in lines:
+        size = len(line['text']) + 10
+        if current_len + size > max_chars and current:
+            chunks.append(current)
+            current, current_len = [line], size
+        else:
+            current.append(line)
+            current_len += size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def build_speaker_script(lines) -> str:
+    return "\n".join(l['text'] for l in lines)
+
+
+# ═══════════════════════════════════════════
+# 번역 (화자 태그 보존 — 세그먼트 단위로 번역해 프로그램적으로 태그 재구성)
+# ═══════════════════════════════════════════
+SEGMENT_TRANSLATE_PROMPT = """당신은 한국 문학을 영어로 옮기는 전문 문학 번역가입니다.
+아래 한국어 텍스트를 자연스럽고 문학적인 영어(literary English prose)로 번역하세요.
 
 ## 번역 원칙
 - 직역이 아닌 의역으로, 원작의 정서와 분위기를 살릴 것
 - 지문·묘사는 소설체 영어로, 대화문은 자연스러운 영어 회화체로
 - 인명·지명 등 고유명사는 로마자 표기를 유지
-- 원문의 문단 구분을 최대한 그대로 유지
-- 번역문 외의 설명, 마크다운, 따옴표 안내 등은 절대 출력하지 마세요
+- 번역문 외의 설명, 마크다운, 안내 문구는 절대 출력하지 마세요
 
-번역할 원고:
-{manuscript}
+원문:
+{text}
 
-지금 위 원고 전체를 영어로 번역하세요. 번역문만 출력하세요."""
+번역문만 출력하세요."""
 
 
-def translate_to_english(api_key: str, manuscript: str, model: str) -> str:
+def translate_segment(api_key: str, text: str, model: str) -> str:
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model=model,
-        contents=TRANSLATE_PROMPT.format(manuscript=manuscript)
+        contents=SEGMENT_TRANSLATE_PROMPT.format(text=text)
     )
-    text = response.text.strip()
-    text = re.sub(r"```[a-z]*\n?|```", "", text).strip()
-    return text
+    out = response.text.strip()
+    out = re.sub(r"```[a-z]*\n?", "", out).strip()
+    return out
 
 
-# ═══════════════════════════════════════════
-# 텍스트 청크 분할 (화자 구분 없는 단일 내레이션용)
-# ═══════════════════════════════════════════
-def chunk_text(text: str, max_chars: int = MAX_CHUNK_CHARS):
-    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
-    chunks, current = [], ""
-    for para in paragraphs:
-        candidate = f"{current}\n{para}" if current else para
-        if len(candidate) > max_chars and current:
-            chunks.append(current)
-            current = para
-        else:
-            current = candidate
-        while len(current) > max_chars:
-            chunks.append(current[:max_chars])
-            current = current[max_chars:]
-    if current:
-        chunks.append(current)
-    return chunks
+def translate_tagged_script(api_key: str, tagged_ko: str, model: str, status=None, progress=None) -> str:
+    """화자별로 묶어서 번역 → 화자 태그는 원문 그대로 프로그램이 재구성 (번역 중 태그 깨짐 방지)"""
+    lines = parse_tagged_script(tagged_ko)
+    segs = group_into_segments(lines)
+    en_lines = []
+    for i, seg in enumerate(segs):
+        ko_text = build_speaker_script(seg['lines'])
+        if status is not None:
+            status.markdown(f"🌍 번역 중... {i+1}/{len(segs)} 구간 [{seg['speaker']}]")
+        if progress is not None:
+            progress.progress(i / len(segs))
+        en_text = translate_segment(api_key, ko_text, model)
+        en_lines.append(f"[{seg['speaker']}] {en_text}")
+    if progress is not None:
+        progress.progress(1.0)
+    return "\n".join(en_lines)
 
 
 # ═══════════════════════════════════════════
@@ -182,17 +286,33 @@ def format_duration(seconds: float) -> str:
     return f"{s}초"
 
 
-def generate_mp3_for_text(api_key, text, voice, tts_model, max_chunk_chars, label, status, progress):
-    """텍스트를 청크로 나눠 TTS 생성 후 MP3로 합침"""
+def generate_mp3_for_tagged_text(api_key, tagged_text, voices, tts_model, max_chunk_chars,
+                                  label, status, progress):
+    """화자 태그가 붙은 텍스트를 화자별 목소리로 청크 생성 후 MP3로 합침"""
+    lines = parse_tagged_script(tagged_text)
+    segs_raw = group_into_segments(lines)
+    segs = merge_segments_by_voice(segs_raw, voices)
+    total_chunks = sum(len(chunk_segment_lines(s['lines'], max_chunk_chars)) for s in segs)
+    if total_chunks == 0:
+        raise ValueError("화자 태그가 붙은 줄을 찾지 못했습니다. 태그 변환을 먼저 실행하세요.")
+
     client = genai.Client(api_key=api_key)
-    chunks = chunk_text(text, max_chunk_chars)
     pcm_list = []
-    for i, chunk in enumerate(chunks):
-        status.markdown(f"🎙️ {label} — {i+1}/{len(chunks)} ({len(chunk)}자)")
-        progress.progress(i / len(chunks))
-        seed = SEED_BASE + i
-        pcm = call_tts(client, chunk, voice, tts_model, seed=seed, status=status)
-        pcm_list.append(pcm)
+    chunk_idx = 0
+    for seg in segs:
+        voice = get_voice_for_speaker(seg['speaker'], voices)
+        chunks = chunk_segment_lines(seg['lines'], max_chunk_chars)
+        for chunk in chunks:
+            chars = sum(len(l['text']) for l in chunk)
+            status.markdown(
+                f"🎙️ {label} [{seg['speaker']}] ({voice}) — {chunk_idx+1}/{total_chunks} ({chars}자)"
+            )
+            progress.progress(chunk_idx / total_chunks)
+            script = build_speaker_script(chunk)
+            seed = SEED_BASE + chunk_idx
+            pcm = call_tts(client, script, voice, tts_model, seed=seed, status=status)
+            pcm_list.append(pcm)
+            chunk_idx += 1
     progress.progress(1.0)
     mp3 = merge_to_mp3(pcm_list)
     duration = pcm_duration_seconds(pcm_list)
@@ -207,7 +327,7 @@ st.set_page_config(page_title="한영소리 · KOEN Audio", page_icon="📓", la
 NAVY = "#0f3460"
 
 if st.session_state.pop('_pending_reset', False):
-    for _k in ['translated_text', 'ko_audio', 'en_audio', 'ko_seconds', 'en_seconds']:
+    for _k in ['tagged_ko', 'tagged_en', 'ko_audio', 'en_audio', 'ko_seconds', 'en_seconds']:
         st.session_state.pop(_k, None)
     st.session_state['manuscript']    = ""
     st.session_state['chapter_name']  = ""
@@ -292,24 +412,56 @@ with st.sidebar:
         save_config(cfg)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown(f"<div style='background:{NAVY};border-radius:8px 8px 0 0;padding:8px 12px;margin-top:6px'><span style='color:white;font-size:13px;font-weight:800'>🎙️ 성우 설정</span></div><div style='border:2px solid {NAVY};border-top:none;border-radius:0 0 8px 8px;padding:8px 10px;margin-bottom:6px'>", unsafe_allow_html=True)
+    st.markdown(f"<div style='background:{NAVY};border-radius:8px 8px 0 0;padding:8px 12px;margin-top:6px'><span style='color:white;font-size:13px;font-weight:800'>🎙️ 한국어 성우</span></div><div style='border:2px solid {NAVY};border-top:none;border-radius:0 0 8px 8px;padding:8px 10px;margin-bottom:6px'>", unsafe_allow_html=True)
+    ko_saved = cfg.get("voices_ko", {"M": "Charon", "W": "Kore"})
+    col_km, col_kw = st.columns(2)
+    with col_km:
+        st.caption("🔵 남성(M)")
+        ko_m_def = ko_saved.get("M", "Charon")
+        ko_m_voice = st.selectbox("", MALE_VOICES_KO,
+                                   index=MALE_VOICES_KO.index(ko_m_def) if ko_m_def in MALE_VOICES_KO else 0,
+                                   key="ko_m_voice", label_visibility="collapsed",
+                                   help="\n".join(f"{v}: {VOICE_DESC.get(v,'')}" for v in MALE_VOICES_KO))
+    with col_kw:
+        st.caption("🔴 여성(W)")
+        ko_w_def = ko_saved.get("W", "Kore")
+        ko_w_voice = st.selectbox("", FEMALE_VOICES_KO,
+                                   index=FEMALE_VOICES_KO.index(ko_w_def) if ko_w_def in FEMALE_VOICES_KO else 0,
+                                   key="ko_w_voice", label_visibility="collapsed",
+                                   help="\n".join(f"{v}: {VOICE_DESC.get(v,'')}" for v in FEMALE_VOICES_KO))
+    ko_voices = {"M": ko_m_voice, "W": ko_w_voice}
+    if not IS_CLOUD and ko_voices != ko_saved:
+        cfg["voices_ko"] = ko_voices
+        save_config(cfg)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.caption("🇰🇷 한국어 성우")
-    ko_gender = st.radio("", ["남성", "여성"], horizontal=True, key="ko_gender", label_visibility="collapsed")
-    ko_choices = MALE_VOICES_KO if ko_gender == "남성" else FEMALE_VOICES_KO
-    ko_voice = st.selectbox("", ko_choices, key="ko_voice", label_visibility="collapsed",
-                             help="\n".join(f"{v}: {VOICE_DESC.get(v,'')}" for v in ko_choices))
-    st.markdown(f"<div style='font-size:11px;color:#0f3460;background:rgba(15,52,96,0.08);border-radius:4px;padding:3px 6px;margin-bottom:8px'>{VOICE_DESC.get(ko_voice,'')}</div>", unsafe_allow_html=True)
-
-    st.caption("🇺🇸 영어 성우")
-    en_gender = st.radio("", ["남성", "여성"], horizontal=True, key="en_gender", label_visibility="collapsed")
-    en_choices = MALE_VOICES_EN if en_gender == "남성" else FEMALE_VOICES_EN
-    en_voice = st.selectbox("", en_choices, key="en_voice", label_visibility="collapsed",
-                             help="\n".join(f"{v}: {VOICE_DESC.get(v,'')}" for v in en_choices))
-    st.markdown(f"<div style='font-size:11px;color:#0f3460;background:rgba(15,52,96,0.08);border-radius:4px;padding:3px 6px'>{VOICE_DESC.get(en_voice,'')}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='background:{NAVY};border-radius:8px 8px 0 0;padding:8px 12px;margin-top:6px'><span style='color:white;font-size:13px;font-weight:800'>🎙️ 영어 성우</span></div><div style='border:2px solid {NAVY};border-top:none;border-radius:0 0 8px 8px;padding:8px 10px;margin-bottom:6px'>", unsafe_allow_html=True)
+    en_saved = cfg.get("voices_en", {"M": "Charon", "W": "Aoede"})
+    col_em, col_ew = st.columns(2)
+    with col_em:
+        st.caption("🔵 남성(M)")
+        en_m_def = en_saved.get("M", "Charon")
+        en_m_voice = st.selectbox("", MALE_VOICES_EN,
+                                   index=MALE_VOICES_EN.index(en_m_def) if en_m_def in MALE_VOICES_EN else 0,
+                                   key="en_m_voice", label_visibility="collapsed",
+                                   help="\n".join(f"{v}: {VOICE_DESC.get(v,'')}" for v in MALE_VOICES_EN))
+    with col_ew:
+        st.caption("🔴 여성(W)")
+        en_w_def = en_saved.get("W", "Aoede")
+        en_w_voice = st.selectbox("", FEMALE_VOICES_EN,
+                                   index=FEMALE_VOICES_EN.index(en_w_def) if en_w_def in FEMALE_VOICES_EN else 0,
+                                   key="en_w_voice", label_visibility="collapsed",
+                                   help="\n".join(f"{v}: {VOICE_DESC.get(v,'')}" for v in FEMALE_VOICES_EN))
+    en_voices = {"M": en_m_voice, "W": en_w_voice}
+    if not IS_CLOUD and en_voices != en_saved:
+        cfg["voices_en"] = en_voices
+        save_config(cfg)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown(f"<div style='background:{NAVY};border-radius:8px 8px 0 0;padding:8px 12px;margin-top:6px'><span style='color:white;font-size:13px;font-weight:800'>⚙️ 모델 설정</span></div><div style='border:2px solid {NAVY};border-top:none;border-radius:0 0 8px 8px;padding:8px 10px;margin-bottom:6px'>", unsafe_allow_html=True)
+    tag_model = st.selectbox("🏷️ 화자 태그 변환", ["gemini-2.5-flash", "gemini-2.5-pro"],
+                              index=0, key="tag_model",
+                              help="Flash: 빠르고 충분한 품질 (추천)\nPro: 더 정교한 화자 판단")
     translate_model = st.selectbox("🌍 번역 모델", ["gemini-2.5-pro", "gemini-2.5-flash"],
                                     index=0, key="translate_model",
                                     help="Pro: 문학적 품질 우선 (추천)\nFlash: 빠른 번역")
@@ -348,7 +500,7 @@ with col_title:
     </div>
     """, unsafe_allow_html=True)
     proj_display = f"**{project_name}**" if project_name else "*(프로젝트명 없음)*"
-    st.caption(f"프로젝트: {proj_display}  |  KO={ko_voice} / EN={en_voice}")
+    st.caption(f"프로젝트: {proj_display}  |  KO M={ko_m_voice}/W={ko_w_voice}  |  EN M={en_m_voice}/W={en_w_voice}")
 with col_reset:
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("🔄 새로 시작", use_container_width=True):
@@ -408,48 +560,85 @@ has_text = bool(manuscript and manuscript.strip())
 
 
 # ══════════════════════════════════════════
-# STEP 2: 문학적 영어 번역
+# STEP 2: 화자 태그 변환 (한국어, M/W)
 # ══════════════════════════════════════════
-st.markdown(step_header("2", "문학적 영어 번역", "Gemini가 소설체로 번역, 결과는 직접 수정 가능"),
+st.markdown(step_header("2", "화자 태그 변환", "남/여 대사를 구분 — 감정 태그 없이 [M]/[W]만 사용"),
             unsafe_allow_html=True)
 
-if st.button("🌍 영어로 번역", type="primary" if has_text else "secondary",
+if st.button("🏷️ 화자 태그 변환", type="primary" if has_text else "secondary",
              disabled=not (api_key and has_text), use_container_width=True):
-    with st.status("🌍 문학적 영어로 번역 중...", expanded=True) as status:
-        st.write("Gemini가 소설체 영어로 번역하고 있습니다. (30초~1분 소요)")
+    with st.status("🏷️ 화자를 분석하고 있습니다...", expanded=True) as status:
+        st.write("Gemini가 남/여 대사와 내레이션을 구분하고 있습니다. (30초~1분 소요)")
         try:
-            translated = translate_to_english(api_key, manuscript, translate_model)
-            st.session_state['translated_text'] = translated
+            tagged = convert_tags(api_key, manuscript, tag_model)
+            st.session_state['tagged_ko'] = tagged
+            st.session_state.pop('tagged_en', None)
+            st.session_state.pop('ko_audio', None)
             st.session_state.pop('en_audio', None)
-            status.update(label="✅ 번역 완료", state="complete")
+            status.update(label="✅ 태그 변환 완료", state="complete")
         except Exception as e:
             status.update(label="❌ 오류 발생", state="error")
             st.error(f"❌ {e}")
 
-if 'translated_text' in st.session_state:
-    edited_translation = st.text_area("번역 결과 (직접 수정 가능)",
-        value=st.session_state['translated_text'], height=250, key="translated_text_edit")
-    st.session_state['translated_text'] = edited_translation
-    st.markdown(f"<p style='font-size:14px;color:{NAVY};margin:4px 0'>번역 글자 수: {len(edited_translation):,}자</p>",
+if 'tagged_ko' in st.session_state:
+    edited_ko = st.text_area("화자 태그 원고 (직접 수정 가능)",
+        value=st.session_state['tagged_ko'], height=250, key="tagged_ko_edit")
+    st.session_state['tagged_ko'] = edited_ko
+
+    ko_lines = parse_tagged_script(edited_ko)
+    if ko_lines:
+        sc = {}
+        for l in ko_lines:
+            sc[l['speaker']] = sc.get(l['speaker'], 0) + 1
+        cols = st.columns(len(sc) if sc else 1)
+        for i, (spk, cnt) in enumerate(sc.items()):
+            cols[i].metric(spk, cnt)
+
+
+# ══════════════════════════════════════════
+# STEP 3: 영어로 번역 (화자 유지)
+# ══════════════════════════════════════════
+st.markdown(step_header("3", "문학적 영어 번역", "화자(M/W) 구분을 그대로 유지한 채 번역, 결과는 직접 수정 가능"),
+            unsafe_allow_html=True)
+
+has_tagged_ko = bool(st.session_state.get('tagged_ko', '').strip())
+if st.button("🌍 영어로 번역", type="primary" if has_tagged_ko else "secondary",
+             disabled=not (api_key and has_tagged_ko), use_container_width=True):
+    status = st.empty()
+    progress = st.progress(0)
+    try:
+        translated = translate_tagged_script(api_key, st.session_state['tagged_ko'],
+                                              translate_model, status=status, progress=progress)
+        st.session_state['tagged_en'] = translated
+        st.session_state.pop('en_audio', None)
+        status.markdown("✅ 번역 완료")
+    except Exception as e:
+        st.error(f"❌ {e}")
+
+if 'tagged_en' in st.session_state:
+    edited_en = st.text_area("영어 번역 결과 (화자 태그 포함, 직접 수정 가능)",
+        value=st.session_state['tagged_en'], height=250, key="tagged_en_edit")
+    st.session_state['tagged_en'] = edited_en
+    st.markdown(f"<p style='font-size:14px;color:{NAVY};margin:4px 0'>번역 글자 수: {len(edited_en):,}자</p>",
                 unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════
-# STEP 3 & 4: 오디오 생성
+# STEP 4: 오디오 생성
 # ══════════════════════════════════════════
-st.markdown(step_header("3", "한국어 · 영어 MP3 오디오 생성"), unsafe_allow_html=True)
+st.markdown(step_header("4", "한국어 · 영어 MP3 오디오 생성"), unsafe_allow_html=True)
 
 col_ko, col_en = st.columns(2)
 
 with col_ko:
     st.markdown(f"<b style='color:{NAVY}'>🇰🇷 한국어 MP3</b>", unsafe_allow_html=True)
     if st.button("🎙️ 한국어 MP3 생성", type="primary",
-                 disabled=not (api_key and has_text), use_container_width=True, key="gen_ko"):
+                 disabled=not (api_key and has_tagged_ko), use_container_width=True, key="gen_ko"):
         status = st.empty()
         progress = st.progress(0)
         try:
-            mp3, duration = generate_mp3_for_text(
-                api_key, manuscript, ko_voice, tts_model, max_chunk_chars,
+            mp3, duration = generate_mp3_for_tagged_text(
+                api_key, st.session_state['tagged_ko'], ko_voices, tts_model, max_chunk_chars,
                 "한국어", status, progress
             )
             st.session_state['ko_audio'] = mp3
@@ -468,14 +657,14 @@ with col_ko:
 
 with col_en:
     st.markdown(f"<b style='color:{NAVY}'>🇺🇸 영어 MP3</b>", unsafe_allow_html=True)
-    has_translation = bool(st.session_state.get('translated_text', '').strip())
+    has_tagged_en = bool(st.session_state.get('tagged_en', '').strip())
     if st.button("🎙️ 영어 MP3 생성", type="primary",
-                 disabled=not (api_key and has_translation), use_container_width=True, key="gen_en"):
+                 disabled=not (api_key and has_tagged_en), use_container_width=True, key="gen_en"):
         status = st.empty()
         progress = st.progress(0)
         try:
-            mp3, duration = generate_mp3_for_text(
-                api_key, st.session_state['translated_text'], en_voice, tts_model, max_chunk_chars,
+            mp3, duration = generate_mp3_for_tagged_text(
+                api_key, st.session_state['tagged_en'], en_voices, tts_model, max_chunk_chars,
                 "English", status, progress
             )
             st.session_state['en_audio'] = mp3
