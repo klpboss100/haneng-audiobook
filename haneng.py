@@ -3,7 +3,7 @@
 ─────────────────────────────────────────
 실행: python -m streamlit run haneng.py
 ─────────────────────────────────────────
-한국어 소설 → 화자(M/W) 태그 → 문학적 영어 번역(화자 유지) → 한국어/영어 MP3 동시 제작
+한국어 소설 → 문학적 영어 번역(원고 전체) → 한국어/영어 각각 화자(M/W) 태그 → 한국어/영어 MP3 동시 제작
 """
 
 import streamlit as st
@@ -55,17 +55,18 @@ def save_config(data: dict):
 
 
 # ═══════════════════════════════════════════
-# 화자(M/W) 태그 변환 — 감정 태그 없음
+# 화자(M/W) 태그 변환 — 감정 태그 없음 (한국어/영어 원고 모두에 사용)
 # ═══════════════════════════════════════════
-TAG_PROMPT = """당신은 한국 소설 원고에 화자 태그를 추가하는 전문가입니다.
+TAG_PROMPT = """당신은 소설 원고에 화자 태그를 추가하는 전문가입니다. 원고는 한국어 또는 영어일 수 있으며,
+원고의 언어를 그대로 유지한 채(번역하지 말고) 태그만 추가하세요.
 
 ## 절대 규칙
-- 원고 텍스트를 절대 수정·요약·생략하지 마세요
-- 원고 내용 전체를 빠짐없이 출력하세요
+- 원고 텍스트를 절대 수정·번역·요약·생략하지 마세요
+- 원고 내용 전체를 빠짐없이 원래 언어 그대로 출력하세요
 - 태그만 각 줄 앞에 추가하세요
 
 ## 태그 형식
-[화자] 텍스트   (예: [M] 그는 조용히 웃었다.)
+[화자] 텍스트   (예: [M] 그는 조용히 웃었다. / [M] He smiled quietly.)
 
 ## 화자 종류 (이 두 가지만 사용, 감정 태그는 절대 사용 금지)
 - [M] : 내레이션(지문·묘사) + 모든 남자 대화
@@ -74,10 +75,10 @@ TAG_PROMPT = """당신은 한국 소설 원고에 화자 태그를 추가하는 
 ## 처리 방법
 1. 챕터 제목 → [M]
 2. 내레이션·지문·묘사 → [M]
-3. 대화문("...") → 앞뒤 문맥으로 화자 성별 판단 (여자=[W], 남자/중성/불명=[M])
+3. 대화문("...") → 앞뒤 문맥(대명사, 호칭, 서술 등)으로 화자 성별 판단 (여자=[W], 남자/중성/불명=[M])
 4. 내레이션과 대화가 섞인 문단 → 반드시 줄 단위로 분리
 
-지금 바로 아래 원고 전체에 화자 태그를 추가하세요:
+지금 바로 아래 원고 전체에 화자 태그를 추가하세요 (언어는 원문 그대로 유지):
 
 {manuscript}"""
 
@@ -163,50 +164,33 @@ def build_speaker_script(lines) -> str:
 
 
 # ═══════════════════════════════════════════
-# 번역 (화자 태그 보존 — 세그먼트 단위로 번역해 프로그램적으로 태그 재구성)
+# 번역 (원고 전체를 한 번에 — 문맥이 끊기지 않아 번역 품질이 좋음)
 # ═══════════════════════════════════════════
-SEGMENT_TRANSLATE_PROMPT = """당신은 한국 문학을 영어로 옮기는 전문 문학 번역가입니다.
-아래 한국어 텍스트를 자연스럽고 문학적인 영어(literary English prose)로 번역하세요.
+TRANSLATE_PROMPT = """당신은 한국 문학을 영어로 옮기는 전문 문학 번역가입니다.
+아래 한국어 소설 원고를 자연스럽고 문학적인 영어(literary English prose)로 번역하세요.
 
 ## 번역 원칙
 - 직역이 아닌 의역으로, 원작의 정서와 분위기를 살릴 것
 - 지문·묘사는 소설체 영어로, 대화문은 자연스러운 영어 회화체로
 - 인명·지명 등 고유명사는 로마자 표기를 유지
+- 원문의 문단 구분을 최대한 그대로 유지
 - 번역문 외의 설명, 마크다운, 안내 문구는 절대 출력하지 마세요
 
-원문:
-{text}
+번역할 원고:
+{manuscript}
 
-번역문만 출력하세요."""
+지금 위 원고 전체를 영어로 번역하세요. 번역문만 출력하세요."""
 
 
-def translate_segment(api_key: str, text: str, model: str) -> str:
+def translate_to_english(api_key: str, manuscript: str, model: str) -> str:
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model=model,
-        contents=SEGMENT_TRANSLATE_PROMPT.format(text=text)
+        contents=TRANSLATE_PROMPT.format(manuscript=manuscript)
     )
-    out = response.text.strip()
-    out = re.sub(r"```[a-z]*\n?", "", out).strip()
-    return out
-
-
-def translate_tagged_script(api_key: str, tagged_ko: str, model: str, status=None, progress=None) -> str:
-    """화자별로 묶어서 번역 → 화자 태그는 원문 그대로 프로그램이 재구성 (번역 중 태그 깨짐 방지)"""
-    lines = parse_tagged_script(tagged_ko)
-    segs = group_into_segments(lines)
-    en_lines = []
-    for i, seg in enumerate(segs):
-        ko_text = build_speaker_script(seg['lines'])
-        if status is not None:
-            status.markdown(f"🌍 번역 중... {i+1}/{len(segs)} 구간 [{seg['speaker']}]")
-        if progress is not None:
-            progress.progress(i / len(segs))
-        en_text = translate_segment(api_key, ko_text, model)
-        en_lines.append(f"[{seg['speaker']}] {en_text}")
-    if progress is not None:
-        progress.progress(1.0)
-    return "\n".join(en_lines)
+    text = response.text.strip()
+    text = re.sub(r"```[a-z]*\n?", "", text).strip()
+    return text
 
 
 # ═══════════════════════════════════════════
@@ -327,7 +311,7 @@ st.set_page_config(page_title="한영소리 · KOEN Audio", page_icon="📓", la
 NAVY = "#0f3460"
 
 if st.session_state.pop('_pending_reset', False):
-    for _k in ['tagged_ko', 'tagged_en', 'ko_audio', 'en_audio', 'ko_seconds', 'en_seconds']:
+    for _k in ['translated_text', 'tagged_ko', 'tagged_en', 'ko_audio', 'en_audio', 'ko_seconds', 'en_seconds']:
         st.session_state.pop(_k, None)
     st.session_state['manuscript']    = ""
     st.session_state['chapter_name']  = ""
@@ -560,73 +544,106 @@ has_text = bool(manuscript and manuscript.strip())
 
 
 # ══════════════════════════════════════════
-# STEP 2: 화자 태그 변환 (한국어, M/W)
+# STEP 2: 문학적 영어 번역 (원고 전체를 한 번에)
 # ══════════════════════════════════════════
-st.markdown(step_header("2", "화자 태그 변환", "남/여 대사를 구분 — 감정 태그 없이 [M]/[W]만 사용"),
+st.markdown(step_header("2", "문학적 영어 번역", "원고 전체를 한 번에 번역 — 문맥이 끊기지 않아 품질이 좋음"),
             unsafe_allow_html=True)
 
-if st.button("🏷️ 화자 태그 변환", type="primary" if has_text else "secondary",
+if st.button("🌍 영어로 번역", type="primary" if has_text else "secondary",
              disabled=not (api_key and has_text), use_container_width=True):
-    with st.status("🏷️ 화자를 분석하고 있습니다...", expanded=True) as status:
-        st.write("Gemini가 남/여 대사와 내레이션을 구분하고 있습니다. (30초~1분 소요)")
+    with st.status("🌍 문학적 영어로 번역 중...", expanded=True) as status:
+        st.write("Gemini가 소설체 영어로 번역하고 있습니다. (30초~1분 소요)")
         try:
-            tagged = convert_tags(api_key, manuscript, tag_model)
-            st.session_state['tagged_ko'] = tagged
-            st.session_state.pop('tagged_en', None)
-            st.session_state.pop('ko_audio', None)
-            st.session_state.pop('en_audio', None)
-            status.update(label="✅ 태그 변환 완료", state="complete")
+            translated = translate_to_english(api_key, manuscript, translate_model)
+            st.session_state['translated_text'] = translated
+            for _k in ['tagged_ko', 'tagged_en', 'ko_audio', 'en_audio']:
+                st.session_state.pop(_k, None)
+            status.update(label="✅ 번역 완료", state="complete")
         except Exception as e:
             status.update(label="❌ 오류 발생", state="error")
             st.error(f"❌ {e}")
 
-if 'tagged_ko' in st.session_state:
-    edited_ko = st.text_area("화자 태그 원고 (직접 수정 가능)",
-        value=st.session_state['tagged_ko'], height=250, key="tagged_ko_edit")
-    st.session_state['tagged_ko'] = edited_ko
-
-    ko_lines = parse_tagged_script(edited_ko)
-    if ko_lines:
-        sc = {}
-        for l in ko_lines:
-            sc[l['speaker']] = sc.get(l['speaker'], 0) + 1
-        cols = st.columns(len(sc) if sc else 1)
-        for i, (spk, cnt) in enumerate(sc.items()):
-            cols[i].metric(spk, cnt)
-
-
-# ══════════════════════════════════════════
-# STEP 3: 영어로 번역 (화자 유지)
-# ══════════════════════════════════════════
-st.markdown(step_header("3", "문학적 영어 번역", "화자(M/W) 구분을 그대로 유지한 채 번역, 결과는 직접 수정 가능"),
-            unsafe_allow_html=True)
-
-has_tagged_ko = bool(st.session_state.get('tagged_ko', '').strip())
-if st.button("🌍 영어로 번역", type="primary" if has_tagged_ko else "secondary",
-             disabled=not (api_key and has_tagged_ko), use_container_width=True):
-    status = st.empty()
-    progress = st.progress(0)
-    try:
-        translated = translate_tagged_script(api_key, st.session_state['tagged_ko'],
-                                              translate_model, status=status, progress=progress)
-        st.session_state['tagged_en'] = translated
-        st.session_state.pop('en_audio', None)
-        status.markdown("✅ 번역 완료")
-    except Exception as e:
-        st.error(f"❌ {e}")
-
-if 'tagged_en' in st.session_state:
-    edited_en = st.text_area("영어 번역 결과 (화자 태그 포함, 직접 수정 가능)",
-        value=st.session_state['tagged_en'], height=250, key="tagged_en_edit")
-    st.session_state['tagged_en'] = edited_en
-    st.markdown(f"<p style='font-size:14px;color:{NAVY};margin:4px 0'>번역 글자 수: {len(edited_en):,}자</p>",
+if 'translated_text' in st.session_state:
+    edited_translation = st.text_area("영어 번역 결과 (직접 수정 가능)",
+        value=st.session_state['translated_text'], height=250, key="translated_text_edit")
+    st.session_state['translated_text'] = edited_translation
+    st.markdown(f"<p style='font-size:14px;color:{NAVY};margin:4px 0'>번역 글자 수: {len(edited_translation):,}자</p>",
                 unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════
+# STEP 3: 화자 태그 변환 (한국어 원고 + 영어 번역본 각각 독립적으로)
+# ══════════════════════════════════════════
+st.markdown(step_header("3", "화자 태그 변환", "한국어·영어 각각 독립적으로 남/여 대사 태그 — 감정 태그 없음"),
+            unsafe_allow_html=True)
+st.caption(
+    "두 언어의 태그는 서로 위치가 안 맞아도 상관없습니다 — 한국어 오디오와 영어 오디오는 "
+    "각각 따로 재생되는 파일이라, 언어 안에서만 화자가 일관되면 됩니다."
+)
+
+has_translation = bool(st.session_state.get('translated_text', '').strip())
+col_tag_ko, col_tag_en = st.columns(2)
+with col_tag_ko:
+    if st.button("🏷️ 한국어 태그 변환", type="primary" if has_text else "secondary",
+                 disabled=not (api_key and has_text), use_container_width=True, key="tag_ko_btn"):
+        with st.status("🏷️ 한국어 화자 분석 중...", expanded=True) as status:
+            try:
+                tagged = convert_tags(api_key, manuscript, tag_model)
+                st.session_state['tagged_ko'] = tagged
+                st.session_state.pop('ko_audio', None)
+                status.update(label="✅ 완료", state="complete")
+            except Exception as e:
+                status.update(label="❌ 오류 발생", state="error")
+                st.error(f"❌ {e}")
+with col_tag_en:
+    if st.button("🏷️ 영어 태그 변환", type="primary" if has_translation else "secondary",
+                 disabled=not (api_key and has_translation), use_container_width=True, key="tag_en_btn"):
+        with st.status("🏷️ 영어 화자 분석 중...", expanded=True) as status:
+            try:
+                tagged = convert_tags(api_key, st.session_state['translated_text'], tag_model)
+                st.session_state['tagged_en'] = tagged
+                st.session_state.pop('en_audio', None)
+                status.update(label="✅ 완료", state="complete")
+            except Exception as e:
+                status.update(label="❌ 오류 발생", state="error")
+                st.error(f"❌ {e}")
+
+col_show_ko, col_show_en = st.columns(2)
+with col_show_ko:
+    if 'tagged_ko' in st.session_state:
+        edited_ko = st.text_area("한국어 화자 태그 (직접 수정 가능)",
+            value=st.session_state['tagged_ko'], height=250, key="tagged_ko_edit")
+        st.session_state['tagged_ko'] = edited_ko
+        ko_lines = parse_tagged_script(edited_ko)
+        if ko_lines:
+            sc = {}
+            for l in ko_lines:
+                sc[l['speaker']] = sc.get(l['speaker'], 0) + 1
+            cols = st.columns(len(sc) if sc else 1)
+            for i, (spk, cnt) in enumerate(sc.items()):
+                cols[i].metric(spk, cnt)
+with col_show_en:
+    if 'tagged_en' in st.session_state:
+        edited_en = st.text_area("영어 화자 태그 (직접 수정 가능)",
+            value=st.session_state['tagged_en'], height=250, key="tagged_en_edit")
+        st.session_state['tagged_en'] = edited_en
+        en_lines = parse_tagged_script(edited_en)
+        if en_lines:
+            sc = {}
+            for l in en_lines:
+                sc[l['speaker']] = sc.get(l['speaker'], 0) + 1
+            cols = st.columns(len(sc) if sc else 1)
+            for i, (spk, cnt) in enumerate(sc.items()):
+                cols[i].metric(spk, cnt)
 
 
 # ══════════════════════════════════════════
 # STEP 4: 오디오 생성
 # ══════════════════════════════════════════
 st.markdown(step_header("4", "한국어 · 영어 MP3 오디오 생성"), unsafe_allow_html=True)
+
+has_tagged_ko = bool(st.session_state.get('tagged_ko', '').strip())
+has_tagged_en = bool(st.session_state.get('tagged_en', '').strip())
 
 col_ko, col_en = st.columns(2)
 
@@ -657,7 +674,6 @@ with col_ko:
 
 with col_en:
     st.markdown(f"<b style='color:{NAVY}'>🇺🇸 영어 MP3</b>", unsafe_allow_html=True)
-    has_tagged_en = bool(st.session_state.get('tagged_en', '').strip())
     if st.button("🎙️ 영어 MP3 생성", type="primary",
                  disabled=not (api_key and has_tagged_en), use_container_width=True, key="gen_en"):
         status = st.empty()
