@@ -214,7 +214,12 @@ def to_pcm_bytes(data):
 
 
 def call_tts(client, text, voice_name, tts_model, seed=None, retry=3, status=None):
+    """항상 bytes를 반환하거나 예외를 던짐 — 절대 None을 반환하지 않음.
+    (이전 버전은 rate-limit 재시도가 outer for-range를 다 써버리면 루프가 그냥
+    끝나버려 암묵적으로 None을 반환하는 버그가 있었음 — pcm_list에 None이 섞여
+    나중에 merge_to_mp3에서 TypeError로 터짐)"""
     rate_limit_retries = 0
+    other_retries = 0
     config_kwargs = dict(
         response_modalities=["AUDIO"],
         speech_config=types.SpeechConfig(
@@ -225,7 +230,7 @@ def call_tts(client, text, voice_name, tts_model, seed=None, retry=3, status=Non
     )
     if seed is not None:
         config_kwargs["seed"] = seed
-    for attempt in range(retry):
+    while True:
         try:
             response = client.models.generate_content(
                 model=tts_model,
@@ -251,10 +256,11 @@ def call_tts(client, text, voice_name, tts_model, seed=None, retry=3, status=Non
                     status.markdown(f"⏳ {reason}. {wait_s}초 대기 후 재시도 ({rate_limit_retries}/10)...")
                 time.sleep(wait_s)
                 continue
-            if attempt < retry - 1:
+            other_retries += 1
+            if other_retries < retry:
                 time.sleep(3)
-            else:
-                raise e
+                continue
+            raise e
 
 
 def merge_to_mp3(pcm_list) -> bytes:
@@ -379,6 +385,15 @@ def render_audio_generation_column(lang_label: str, lang_code: str, tagged_key: 
         progress = st.progress(0)
         status = st.empty()
         pcm_list = list((saved_prog or {}).get('pcm_list', [])) if resume_from > 0 else []
+
+        # 저장된 진행상황에 손상된(None 등) 청크가 섞여 있으면 그 지점부터 다시 생성
+        for i, p in enumerate(pcm_list):
+            if not isinstance(p, (bytes, bytearray)):
+                pcm_list = pcm_list[:i]
+                resume_from = i
+                st.warning(f"⚠️ 저장된 {i+1}번째 청크 데이터가 손상되어 그 지점부터 다시 생성합니다.")
+                break
+
         error_flag = False
         done = resume_from
         chunk_idx = 0
