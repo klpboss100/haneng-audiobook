@@ -341,6 +341,23 @@ def edit_copy_save_block(label: str, session_key: str, widget_key: str, height: 
     return edited
 
 
+def direct_tag_input_block(lang_label: str, mode_key: str, session_key: str):
+    """이미 태그가 붙은 원고가 있으면 AI 변환 없이 바로 붙여넣기 (audiobook-maker와 동일한 패턴)"""
+    direct_text = st.text_area(f"{lang_label} 태그 원고 붙여넣기", height=200,
+        placeholder="[M] 텍스트...\n[W] 텍스트...", key=f"{mode_key}_text")
+    cd1, cd2 = st.columns(2)
+    with cd1:
+        if st.button("✅ 확인", type="primary", use_container_width=True, key=f"{mode_key}_confirm"):
+            if direct_text.strip():
+                st.session_state[session_key] = direct_text
+                st.session_state[mode_key] = False
+                st.rerun()
+    with cd2:
+        if st.button("❌ 취소", use_container_width=True, key=f"{mode_key}_cancel"):
+            st.session_state[mode_key] = False
+            st.rerun()
+
+
 def render_audio_generation_column(lang_label: str, lang_code: str, tagged_key: str, voices: dict,
                                     tts_model: str, max_chunk_chars: int, progress_file: str,
                                     project_name: str, chapter_name: str, api_key: str, has_tagged: bool):
@@ -453,7 +470,8 @@ st.set_page_config(page_title="한영소리 · KOEN Audio", page_icon="📓", la
 NAVY = "#0f3460"
 
 if st.session_state.pop('_pending_reset', False):
-    for _k in ['translated_text', 'tagged_ko', 'tagged_en', 'ko_audio', 'en_audio', 'ko_seconds', 'en_seconds']:
+    for _k in ['translated_text', 'tagged_ko', 'tagged_en', 'ko_audio', 'en_audio', 'ko_seconds', 'en_seconds',
+               'direct_input_mode_ko', 'direct_input_mode_en']:
         st.session_state.pop(_k, None)
     st.session_state['manuscript']    = ""
     st.session_state['chapter_name']  = ""
@@ -727,29 +745,48 @@ st.caption(
 has_translation = bool(st.session_state.get('translated_text', '').strip())
 col_tag_ko, col_tag_en = st.columns(2)
 with col_tag_ko:
-    if st.button("🏷️ 한국어 태그 변환", type="primary" if has_text else "secondary",
-                 disabled=not (api_key and has_text), use_container_width=True, key="tag_ko_btn"):
-        with st.status("🏷️ 한국어 화자 분석 중...", expanded=True) as status:
-            try:
-                tagged = convert_tags(api_key, manuscript, tag_model)
-                st.session_state['tagged_ko'] = tagged
-                st.session_state.pop('ko_audio', None)
-                status.update(label="✅ 완료", state="complete")
-            except Exception as e:
-                status.update(label="❌ 오류 발생", state="error")
-                st.error(f"❌ {e}")
+    cko1, cko2 = st.columns(2)
+    with cko1:
+        if st.button("🏷️ 한국어 태그 변환", type="primary" if has_text else "secondary",
+                     disabled=not (api_key and has_text), use_container_width=True, key="tag_ko_btn"):
+            with st.status("🏷️ 한국어 화자 분석 중...", expanded=True) as status:
+                try:
+                    tagged = convert_tags(api_key, manuscript, tag_model)
+                    st.session_state['tagged_ko'] = tagged
+                    st.session_state.pop('ko_audio', None)
+                    status.update(label="✅ 완료", state="complete")
+                except Exception as e:
+                    status.update(label="❌ 오류 발생", state="error")
+                    st.error(f"❌ {e}")
+    with cko2:
+        if st.button("📋 한국어 태그 직접 입력", use_container_width=True, key="direct_ko_btn"):
+            st.session_state['direct_input_mode_ko'] = True
+            st.session_state.pop('tagged_ko', None)
+            st.rerun()
 with col_tag_en:
-    if st.button("🏷️ 영어 태그 변환", type="primary" if has_translation else "secondary",
-                 disabled=not (api_key and has_translation), use_container_width=True, key="tag_en_btn"):
-        with st.status("🏷️ 영어 화자 분석 중...", expanded=True) as status:
-            try:
-                tagged = convert_tags(api_key, st.session_state['translated_text'], tag_model)
-                st.session_state['tagged_en'] = tagged
-                st.session_state.pop('en_audio', None)
-                status.update(label="✅ 완료", state="complete")
-            except Exception as e:
-                status.update(label="❌ 오류 발생", state="error")
-                st.error(f"❌ {e}")
+    cen1, cen2 = st.columns(2)
+    with cen1:
+        if st.button("🏷️ 영어 태그 변환", type="primary" if has_translation else "secondary",
+                     disabled=not (api_key and has_translation), use_container_width=True, key="tag_en_btn"):
+            with st.status("🏷️ 영어 화자 분석 중...", expanded=True) as status:
+                try:
+                    tagged = convert_tags(api_key, st.session_state['translated_text'], tag_model)
+                    st.session_state['tagged_en'] = tagged
+                    st.session_state.pop('en_audio', None)
+                    status.update(label="✅ 완료", state="complete")
+                except Exception as e:
+                    status.update(label="❌ 오류 발생", state="error")
+                    st.error(f"❌ {e}")
+    with cen2:
+        if st.button("📋 영어 태그 직접 입력", use_container_width=True, key="direct_en_btn"):
+            st.session_state['direct_input_mode_en'] = True
+            st.session_state.pop('tagged_en', None)
+            st.rerun()
+
+if st.session_state.get('direct_input_mode_ko'):
+    direct_tag_input_block("한국어", 'direct_input_mode_ko', 'tagged_ko')
+if st.session_state.get('direct_input_mode_en'):
+    direct_tag_input_block("영어", 'direct_input_mode_en', 'tagged_en')
 
 col_show_ko, col_show_en = st.columns(2)
 with col_show_ko:
