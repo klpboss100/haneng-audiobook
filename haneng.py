@@ -200,6 +200,17 @@ def generate_silence(seconds: float) -> bytes:
     return bytes(int(SAMPLE_RATE * seconds) * 2)
 
 
+def to_pcm_bytes(data):
+    """TTS 응답의 오디오 데이터를 항상 순수 bytes로 변환.
+    google-genai 버전/환경에 따라 str(base64)나 bytearray로 올 수 있어 방어적으로 처리."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return bytes(data)
+    if isinstance(data, str):
+        import base64
+        return base64.b64decode(data)
+    raise TypeError(f"예상치 못한 TTS 오디오 데이터 타입: {type(data)}")
+
+
 def call_tts(client, text, voice_name, tts_model, seed=None, retry=3, status=None):
     rate_limit_retries = 0
     config_kwargs = dict(
@@ -223,7 +234,7 @@ def call_tts(client, text, voice_name, tts_model, seed=None, retry=3, status=Non
                 response.candidates[0].content and
                 response.candidates[0].content.parts and
                 response.candidates[0].content.parts[0].inline_data):
-                return response.candidates[0].content.parts[0].inline_data.data
+                return to_pcm_bytes(response.candidates[0].content.parts[0].inline_data.data)
             return generate_silence(0.5)
         except Exception as e:
             msg = str(e)
