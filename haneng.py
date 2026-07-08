@@ -7,7 +7,7 @@
 """
 
 import streamlit as st
-import re, io, time, json, os, random
+import re, io, time, json, os, random, pickle
 import lameenc
 
 # 환경 자동 감지: Streamlit Cloud = /home/appuser
@@ -22,6 +22,8 @@ SAMPLE_RATE     = 24000
 MAX_CHUNK_CHARS = 900   # TTS 1회 호출당 최대 글자수 (길면 잡음/에코 위험 ↑ - 구글 TTS 알려진 한계)
 SEED_BASE       = 7     # 목소리 톤이 매 호출마다 튀는 것을 완화 (best-effort 결정성)
 CONFIG_FILE     = "config_haneng.json"
+PROGRESS_FILE_KO = "progress_ko.pkl"
+PROGRESS_FILE_EN = "progress_en.pkl"
 
 MALE_VOICES_KO   = ["Charon", "Fenrir"]
 FEMALE_VOICES_KO = ["Kore", "Aoede"]
@@ -281,37 +283,151 @@ def format_duration(seconds: float) -> str:
     return f"{s}초"
 
 
-def generate_mp3_for_tagged_text(api_key, tagged_text, voices, tts_model, max_chunk_chars,
-                                  label, status, progress):
-    """화자 태그가 붙은 텍스트를 화자별 목소리로 청크 생성 후 MP3로 합침"""
+def plan_tts_chunks(tagged_text, voices, max_chunk_chars):
+    """화자 태그 텍스트를 화자별 목소리 기준으로 병합·청크 분할한 세그먼트 목록과 총 청크 수 계산"""
     lines = parse_tagged_script(tagged_text)
     segs_raw = group_into_segments(lines)
     segs = merge_segments_by_voice(segs_raw, voices)
     total_chunks = sum(len(chunk_segment_lines(s['lines'], max_chunk_chars)) for s in segs)
-    if total_chunks == 0:
-        raise ValueError("화자 태그가 붙은 줄을 찾지 못했습니다. 태그 변환을 먼저 실행하세요.")
+    return segs, total_chunks
 
-    client = genai.Client(api_key=api_key)
-    pcm_list = []
-    chunk_idx = 0
-    for seg in segs:
-        voice = get_voice_for_speaker(seg['speaker'], voices)
-        chunks = chunk_segment_lines(seg['lines'], max_chunk_chars)
-        for chunk in chunks:
-            chars = sum(len(l['text']) for l in chunk)
-            status.markdown(
-                f"🎙️ {label} [{seg['speaker']}] ({voice}) — {chunk_idx+1}/{total_chunks} ({chars}자)"
-            )
-            progress.progress(chunk_idx / total_chunks)
-            script = build_speaker_script(chunk)
-            seed = SEED_BASE + chunk_idx
-            pcm = call_tts(client, script, voice, tts_model, seed=seed, status=status)
-            pcm_list.append(pcm)
-            chunk_idx += 1
-    progress.progress(1.0)
-    mp3 = merge_to_mp3(pcm_list)
-    duration = pcm_duration_seconds(pcm_list)
-    return mp3, duration
+
+# ═══════════════════════════════════════════
+# 오디오 생성 진행상황 저장/재개 (audiobook-maker와 동일한 방식)
+# ═══════════════════════════════════════════
+def save_progress(path: str, pcm_list, done: int, chapter: str):
+    with open(path, 'wb') as f:
+        pickle.dump({'pcm_list': pcm_list, 'done': done, 'chapter': chapter}, f)
+
+
+def load_progress(path: str):
+    if os.path.exists(path):
+        try:
+            with open(path, 'rb') as f:
+                return pickle.load(f)
+        except Exception:
+            pass
+    return None
+
+
+def clear_progress(path: str):
+    if os.path.exists(path):
+        os.remove(path)
+
+
+# ═══════════════════════════════════════════
+# UI 헬퍼 — 단계마다 수정/복사/저장을 한 세트로 제공
+# ═══════════════════════════════════════════
+def edit_copy_save_block(label: str, session_key: str, widget_key: str, height: int, filename: str) -> str:
+    """텍스트 영역(수정) + 복사용 코드뷰(복사) + 다운로드(저장)를 한 번에 제공"""
+    text_val = st.session_state.get(session_key, "")
+    edited = st.text_area(label, value=text_val, height=height, key=widget_key)
+    st.session_state[session_key] = edited
+
+    c1, c2 = st.columns(2)
+    with c1:
+        with st.popover("📋 복사", use_container_width=True):
+            st.caption("오른쪽 위 아이콘을 클릭하면 클립보드에 복사됩니다.")
+            st.code(edited, language=None)
+    with c2:
+        st.download_button("⬇️ 저장", data=edited.encode("utf-8"), file_name=filename,
+                            mime="text/plain", use_container_width=True, key=f"dl_{widget_key}")
+    return edited
+
+
+def render_audio_generation_column(lang_label: str, lang_code: str, tagged_key: str, voices: dict,
+                                    tts_model: str, max_chunk_chars: int, progress_file: str,
+                                    project_name: str, chapter_name: str, api_key: str, has_tagged: bool):
+    """audiobook-maker와 동일한 이어서 생성(재개) 기능을 갖춘 언어별 오디오 생성 UI"""
+    st.markdown(f"<b style='color:{NAVY}'>{lang_label}</b>", unsafe_allow_html=True)
+
+    audio_key = f"{lang_code}_audio"
+    seconds_key = f"{lang_code}_seconds"
+
+    resume_from = None
+    segs, total_chunks, saved_prog = [], 0, None
+
+    if has_tagged:
+        segs, total_chunks = plan_tts_chunks(st.session_state[tagged_key], voices, max_chunk_chars)
+        st.caption(f"청크 {total_chunks}개 (최대 {max_chunk_chars}자)")
+
+        saved_prog = load_progress(progress_file)
+        has_progress = saved_prog is not None and saved_prog.get('chapter') == chapter_name
+        if has_progress:
+            done_so_far = saved_prog.get('done', 0)
+            st.warning(f"⏸️ 이전 작업: {done_so_far}/{total_chunks} 청크에서 중단됨")
+            cb1, cb2 = st.columns(2)
+            with cb1:
+                start_btn = st.button("▶️ 이어서 생성", type="primary", disabled=not api_key,
+                                       use_container_width=True, key=f"resume_{lang_code}")
+            with cb2:
+                if st.button("🔄 처음부터", use_container_width=True, key=f"restart_{lang_code}"):
+                    clear_progress(progress_file)
+                    st.rerun()
+            resume_from = done_so_far if start_btn else None
+        else:
+            start_btn = st.button(f"🎙️ {lang_label} 생성", type="primary", disabled=not api_key,
+                                   use_container_width=True, key=f"gen_{lang_code}")
+            resume_from = 0 if start_btn else None
+    else:
+        st.button(f"🎙️ {lang_label} 생성", type="primary", disabled=True,
+                  use_container_width=True, key=f"gen_{lang_code}_disabled")
+
+    if resume_from is not None:
+        gen_start = time.time()
+        client = genai.Client(api_key=api_key)
+        progress = st.progress(0)
+        status = st.empty()
+        pcm_list = list((saved_prog or {}).get('pcm_list', [])) if resume_from > 0 else []
+        error_flag = False
+        done = resume_from
+        chunk_idx = 0
+
+        for seg in segs:
+            voice = get_voice_for_speaker(seg['speaker'], voices)
+            chunks = chunk_segment_lines(seg['lines'], max_chunk_chars)
+            for chunk in chunks:
+                if chunk_idx < resume_from:
+                    chunk_idx += 1
+                    continue
+                chars = sum(len(l['text']) for l in chunk)
+                status.markdown(
+                    f"🎙️ [{seg['speaker']}] ({voice}) — {done+1}/{total_chunks} ({chars}자)"
+                )
+                progress.progress(done / total_chunks)
+                try:
+                    script = build_speaker_script(chunk)
+                    seed = SEED_BASE + chunk_idx
+                    pcm = call_tts(client, script, voice, tts_model, seed=seed, status=status)
+                    pcm_list.append(pcm)
+                    done += 1
+                    chunk_idx += 1
+                    save_progress(progress_file, list(pcm_list), done, chapter_name)
+                except Exception as e:
+                    st.error(f"❌ [{seg['speaker']}] {e}")
+                    st.info(f"💾 {done}청크까지 저장됨. [▶️ 이어서 생성]으로 재시작하세요.")
+                    error_flag = True
+                    break
+            if error_flag:
+                break
+
+        if not error_flag and pcm_list:
+            status.markdown("🔗 MP3로 합치는 중...")
+            mp3 = merge_to_mp3(pcm_list)
+            st.session_state[audio_key] = mp3
+            st.session_state[seconds_key] = pcm_duration_seconds(pcm_list)
+            clear_progress(progress_file)
+            progress.progress(1.0)
+            status.markdown(f"🎧 완료! (길이 {format_duration(st.session_state[seconds_key])}, "
+                             f"소요시간 {format_duration(time.time() - gen_start)})")
+
+    if audio_key in st.session_state:
+        mp3 = st.session_state[audio_key]
+        fname = f"{project_name}_{chapter_name}_{lang_code.upper()}.mp3"
+        st.success(f"✅ {len(mp3)/1024/1024:.1f} MB  |  🎵 {format_duration(st.session_state.get(seconds_key, 0))}")
+        st.audio(mp3, format="audio/mp3")
+        st.download_button(f"⬇️ {fname} 저장", data=mp3, file_name=fname,
+                            mime="audio/mpeg", use_container_width=True, key=f"dl_{lang_code}")
 
 
 # ═══════════════════════════════════════════
@@ -575,9 +691,10 @@ if st.button("🌍 영어로 번역", type="primary" if has_text else "secondary
             st.error(f"❌ {e}")
 
 if 'translated_text' in st.session_state:
-    edited_translation = st.text_area("영어 번역 결과 (직접 수정 가능)",
-        value=st.session_state['translated_text'], height=250, key="translated_text_edit")
-    st.session_state['translated_text'] = edited_translation
+    edited_translation = edit_copy_save_block(
+        "영어 번역 결과 (수정 가능)", 'translated_text', 'translated_text_edit', 250,
+        f"{project_name}_{chapter_name}_영어번역.txt"
+    )
     st.markdown(f"<p style='font-size:14px;color:{NAVY};margin:4px 0'>번역 글자 수: {len(edited_translation):,}자</p>",
                 unsafe_allow_html=True)
 
@@ -622,9 +739,10 @@ with col_tag_en:
 col_show_ko, col_show_en = st.columns(2)
 with col_show_ko:
     if 'tagged_ko' in st.session_state:
-        edited_ko = st.text_area("한국어 화자 태그 (직접 수정 가능)",
-            value=st.session_state['tagged_ko'], height=250, key="tagged_ko_edit")
-        st.session_state['tagged_ko'] = edited_ko
+        edited_ko = edit_copy_save_block(
+            "한국어 화자 태그 (수정 가능)", 'tagged_ko', 'tagged_ko_edit', 250,
+            f"{project_name}_{chapter_name}_한국어태그.txt"
+        )
         ko_lines = parse_tagged_script(edited_ko)
         if ko_lines:
             sc = {}
@@ -635,9 +753,10 @@ with col_show_ko:
                 cols[i].metric(spk, cnt)
 with col_show_en:
     if 'tagged_en' in st.session_state:
-        edited_en = st.text_area("영어 화자 태그 (직접 수정 가능)",
-            value=st.session_state['tagged_en'], height=250, key="tagged_en_edit")
-        st.session_state['tagged_en'] = edited_en
+        edited_en = edit_copy_save_block(
+            "영어 화자 태그 (수정 가능)", 'tagged_en', 'tagged_en_edit', 250,
+            f"{project_name}_{chapter_name}_영어태그.txt"
+        )
         en_lines = parse_tagged_script(edited_en)
         if en_lines:
             sc = {}
@@ -649,9 +768,10 @@ with col_show_en:
 
 
 # ══════════════════════════════════════════
-# STEP 4: 오디오 생성
+# STEP 4: 오디오 생성 (중단 시 이어서 생성 가능 — audiobook-maker와 동일)
 # ══════════════════════════════════════════
-st.markdown(step_header("4", "한국어 · 영어 MP3 오디오 생성"), unsafe_allow_html=True)
+st.markdown(step_header("4", "한국어 · 영어 MP3 오디오 생성",
+            "생성이 중단돼도 처음부터 다시 하지 않고 이어서 생성할 수 있습니다"), unsafe_allow_html=True)
 
 has_tagged_ko = bool(st.session_state.get('tagged_ko', '').strip())
 has_tagged_en = bool(st.session_state.get('tagged_en', '').strip())
@@ -659,51 +779,13 @@ has_tagged_en = bool(st.session_state.get('tagged_en', '').strip())
 col_ko, col_en = st.columns(2)
 
 with col_ko:
-    st.markdown(f"<b style='color:{NAVY}'>🇰🇷 한국어 MP3</b>", unsafe_allow_html=True)
-    if st.button("🎙️ 한국어 MP3 생성", type="primary",
-                 disabled=not (api_key and has_tagged_ko), use_container_width=True, key="gen_ko"):
-        status = st.empty()
-        progress = st.progress(0)
-        try:
-            mp3, duration = generate_mp3_for_tagged_text(
-                api_key, st.session_state['tagged_ko'], ko_voices, tts_model, max_chunk_chars,
-                "한국어", status, progress
-            )
-            st.session_state['ko_audio'] = mp3
-            st.session_state['ko_seconds'] = duration
-            status.markdown(f"🎧 완료! (길이 {format_duration(duration)})")
-        except Exception as e:
-            st.error(f"❌ {e}")
-
-    if 'ko_audio' in st.session_state:
-        ko_mp3 = st.session_state['ko_audio']
-        ko_fname = f"{project_name}_{chapter_name}_KO.mp3"
-        st.success(f"✅ {len(ko_mp3)/1024/1024:.1f} MB  |  🎵 {format_duration(st.session_state.get('ko_seconds', 0))}")
-        st.audio(ko_mp3, format="audio/mp3")
-        st.download_button(f"⬇️ {ko_fname} 저장", data=ko_mp3, file_name=ko_fname,
-                            mime="audio/mpeg", use_container_width=True, key="dl_ko")
+    render_audio_generation_column(
+        "🇰🇷 한국어 MP3", "ko", 'tagged_ko', ko_voices, tts_model, max_chunk_chars,
+        PROGRESS_FILE_KO, project_name, chapter_name, api_key, has_tagged_ko
+    )
 
 with col_en:
-    st.markdown(f"<b style='color:{NAVY}'>🇺🇸 영어 MP3</b>", unsafe_allow_html=True)
-    if st.button("🎙️ 영어 MP3 생성", type="primary",
-                 disabled=not (api_key and has_tagged_en), use_container_width=True, key="gen_en"):
-        status = st.empty()
-        progress = st.progress(0)
-        try:
-            mp3, duration = generate_mp3_for_tagged_text(
-                api_key, st.session_state['tagged_en'], en_voices, tts_model, max_chunk_chars,
-                "English", status, progress
-            )
-            st.session_state['en_audio'] = mp3
-            st.session_state['en_seconds'] = duration
-            status.markdown(f"🎧 Done! (length {format_duration(duration)})")
-        except Exception as e:
-            st.error(f"❌ {e}")
-
-    if 'en_audio' in st.session_state:
-        en_mp3 = st.session_state['en_audio']
-        en_fname = f"{project_name}_{chapter_name}_EN.mp3"
-        st.success(f"✅ {len(en_mp3)/1024/1024:.1f} MB  |  🎵 {format_duration(st.session_state.get('en_seconds', 0))}")
-        st.audio(en_mp3, format="audio/mp3")
-        st.download_button(f"⬇️ {en_fname} 저장", data=en_mp3, file_name=en_fname,
-                            mime="audio/mpeg", use_container_width=True, key="dl_en")
+    render_audio_generation_column(
+        "🇺🇸 영어 MP3", "en", 'tagged_en', en_voices, tts_model, max_chunk_chars,
+        PROGRESS_FILE_EN, project_name, chapter_name, api_key, has_tagged_en
+    )
