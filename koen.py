@@ -1,7 +1,7 @@
 """
 한영소리 (KOEN Audio)
 ─────────────────────────────────────────
-실행: python -m streamlit run haneng.py
+실행: python -m streamlit run koen.py
 ─────────────────────────────────────────
 한국어 소설 → 문학적 영어 번역(원고 전체) → 영어 품질검사 → 영어 화자(M/W) 태그 → 영어 MP3 제작
 (한국어 오디오 제작은 audiobook-maker 앱에서 별도로 진행합니다)
@@ -28,7 +28,7 @@ def make_client(api_key: str) -> genai.Client:
 SAMPLE_RATE     = 24000
 MAX_CHUNK_CHARS = 900   # TTS 1회 호출당 최대 글자수 (길면 잡음/에코 위험 ↑ - 구글 TTS 알려진 한계)
 SEED_BASE       = 7     # 목소리 톤이 매 호출마다 튀는 것을 완화 (best-effort 결정성)
-CONFIG_FILE     = "config_haneng.json"
+CONFIG_FILE     = "config_koen.json"
 
 MALE_VOICES_EN   = ["Charon", "Orus"]
 FEMALE_VOICES_EN = ["Aoede", "Leda"]
