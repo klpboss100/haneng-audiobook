@@ -427,16 +427,18 @@ def edit_copy_save_block(label: str, session_key: str, widget_key: str, height: 
     return edited
 
 
-def direct_tag_input_block(lang_label: str, mode_key: str, session_key: str):
-    """이미 태그가 붙은 원고가 있으면 AI 변환 없이 바로 붙여넣기"""
-    direct_text = st.text_area(f"{lang_label} 태그 원고 붙여넣기", height=200,
-        placeholder="[M] 텍스트...\n[W] 텍스트...", key=f"{mode_key}_text")
+def direct_text_input_block(prompt_label: str, mode_key: str, session_key: str,
+                             placeholder: str = "", also_clear=None):
+    """이미 만들어둔 결과물(번역/태그 등)이 있으면 AI 호출 없이 바로 붙여넣기"""
+    direct_text = st.text_area(prompt_label, height=200, placeholder=placeholder, key=f"{mode_key}_text")
     cd1, cd2 = st.columns(2)
     with cd1:
         if st.button("✅ 확인", type="primary", use_container_width=True, key=f"{mode_key}_confirm"):
             if direct_text.strip():
                 st.session_state[session_key] = direct_text
                 st.session_state[mode_key] = False
+                for k in (also_clear or []):
+                    st.session_state.pop(k, None)
                 st.rerun()
     with cd2:
         if st.button("❌ 취소", use_container_width=True, key=f"{mode_key}_cancel"):
@@ -544,7 +546,7 @@ NAVY = "#0f3460"
 if st.session_state.pop('_pending_reset', False):
     for _k in ['translated_text', 'analysis_result_en', 'analysis_text_en', 'accepted_fixes_en',
                'issue_filter_en', 'translated_checked', 'tagged_en', 'en_audio', 'en_seconds',
-               'direct_input_mode_en']:
+               'direct_input_mode_en', 'direct_input_mode_translate']:
         st.session_state.pop(_k, None)
     st.session_state['manuscript']    = ""
     st.session_state['chapter_name']  = ""
@@ -762,20 +764,35 @@ has_text = bool(manuscript and manuscript.strip())
 st.markdown(step_header("2", "문학적 영어 번역", "원고 전체를 한 번에 번역 — 문맥이 끊기지 않아 품질이 좋음"),
             unsafe_allow_html=True)
 
-if st.button("🌍 영어로 번역", type="primary" if has_text else "secondary",
-             disabled=not (api_key and has_text), use_container_width=True):
-    with st.status("🌍 문학적 영어로 번역 중...", expanded=True) as status:
-        st.write("Gemini가 소설체 영어로 번역하고 있습니다. (30초~1분 소요)")
-        try:
-            translated = translate_to_english(api_key, manuscript, translate_model)
-            st.session_state['translated_text'] = translated
-            for _k in ['analysis_result_en', 'analysis_text_en', 'accepted_fixes_en',
-                       'translated_checked', 'tagged_en', 'en_audio']:
-                st.session_state.pop(_k, None)
-            status.update(label="✅ 번역 완료", state="complete")
-        except Exception as e:
-            status.update(label="❌ 오류 발생", state="error")
-            st.error(f"❌ {e}")
+col_tr1, col_tr2 = st.columns(2)
+with col_tr1:
+    if st.button("🌍 영어로 번역", type="primary" if has_text else "secondary",
+                 disabled=not (api_key and has_text), use_container_width=True, key="translate_btn"):
+        with st.status("🌍 문학적 영어로 번역 중...", expanded=True) as status:
+            st.write("Gemini가 소설체 영어로 번역하고 있습니다. (30초~1분 소요)")
+            try:
+                translated = translate_to_english(api_key, manuscript, translate_model)
+                st.session_state['translated_text'] = translated
+                for _k in ['analysis_result_en', 'analysis_text_en', 'accepted_fixes_en',
+                           'translated_checked', 'tagged_en', 'en_audio']:
+                    st.session_state.pop(_k, None)
+                status.update(label="✅ 번역 완료", state="complete")
+            except Exception as e:
+                status.update(label="❌ 오류 발생", state="error")
+                st.error(f"❌ {e}")
+with col_tr2:
+    if st.button("📋 번역 직접입력", use_container_width=True, key="direct_translate_btn"):
+        st.session_state['direct_input_mode_translate'] = True
+        st.session_state.pop('translated_text', None)
+        st.rerun()
+
+if st.session_state.get('direct_input_mode_translate'):
+    direct_text_input_block(
+        "영어 번역 붙여넣기", 'direct_input_mode_translate', 'translated_text',
+        placeholder="이미 번역해둔 영어 원고를 붙여넣으세요...",
+        also_clear=['analysis_result_en', 'analysis_text_en', 'accepted_fixes_en',
+                    'translated_checked', 'tagged_en', 'en_audio']
+    )
 
 if 'translated_text' in st.session_state:
     edited_translation = edit_copy_save_block(
@@ -980,6 +997,14 @@ st.markdown(step_header("4", "영어 화자 태그 변환", "남/여 대사 태�
 
 has_checked = bool(st.session_state.get('translated_checked', '').strip())
 
+if has_checked:
+    edited_checked = edit_copy_save_block(
+        "검사 완료 영어 원고 (수정 가능 · 저장 후 화자 태그 변환)",
+        'translated_checked', 'translated_checked_edit', 200,
+        f"{project_name}_{chapter_name}_영어검수원고.txt"
+    )
+    has_checked = bool(edited_checked.strip())
+
 col_tag1, col_tag2 = st.columns(2)
 with col_tag1:
     if st.button("🏷️ 화자 태그 변환", type="primary" if has_checked else "secondary",
@@ -1000,7 +1025,11 @@ with col_tag2:
         st.rerun()
 
 if st.session_state.get('direct_input_mode_en'):
-    direct_tag_input_block("영어", 'direct_input_mode_en', 'tagged_en')
+    direct_text_input_block(
+        "영어 태그 원고 붙여넣기", 'direct_input_mode_en', 'tagged_en',
+        placeholder="[M] 텍스트...\n[W] 텍스트...",
+        also_clear=['en_audio']
+    )
 
 if 'tagged_en' in st.session_state:
     edited_en = edit_copy_save_block(
