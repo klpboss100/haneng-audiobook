@@ -26,7 +26,8 @@ def make_client(api_key: str) -> genai.Client:
 # 상수
 # ═══════════════════════════════════════════
 SAMPLE_RATE     = 24000
-MAX_CHUNK_CHARS = 900   # TTS 1회 호출당 최대 글자수 (길면 잡음/에코 위험 ↑ - 구글 TTS 알려진 한계)
+MAX_CHUNK_CHARS = 4000  # TTS 1회 호출당 최대 글자수. 짧을수록 API 호출 수가 늘어 분당 요청
+                        # 제한에 훨씬 자주 걸림 — 슬라이더로 필요시 낮출 수 있음
 SEED_BASE       = 7     # 목소리 톤이 매 호출마다 튀는 것을 완화 (best-effort 결정성)
 CONFIG_FILE     = "config_koen.json"
 
@@ -428,11 +429,14 @@ def edit_copy_save_block(label: str, session_key: str, widget_key: str, height: 
 
 
 def direct_text_input_block(prompt_label: str, mode_key: str, session_key: str,
-                             placeholder: str = "", also_clear=None):
-    """이미 만들어둔 결과물(번역/태그 등)이 있으면 AI 호출 없이 바로 붙여넣기"""
+                             placeholder: str = "", also_clear=None,
+                             skip_key: str = None, skip_label: str = "⏭️ 건너뛰기"):
+    """이미 만들어둔 결과물(번역/태그 등)이 있으면 AI 호출 없이 바로 붙여넣기.
+    skip_key를 주면, 확인/취소 옆에 '다음 단계까지 건너뛰기' 버튼도 함께 제공
+    (예: 번역 붙여넣기 + 품질검사 단계 자체를 생략)."""
     direct_text = st.text_area(prompt_label, height=200, placeholder=placeholder, key=f"{mode_key}_text")
-    cd1, cd2 = st.columns(2)
-    with cd1:
+    cols = st.columns(3 if skip_key else 2)
+    with cols[0]:
         if st.button("✅ 확인", type="primary", use_container_width=True, key=f"{mode_key}_confirm"):
             if direct_text.strip():
                 st.session_state[session_key] = direct_text
@@ -440,10 +444,20 @@ def direct_text_input_block(prompt_label: str, mode_key: str, session_key: str,
                 for k in (also_clear or []):
                     st.session_state.pop(k, None)
                 st.rerun()
-    with cd2:
+    with cols[1]:
         if st.button("❌ 취소", use_container_width=True, key=f"{mode_key}_cancel"):
             st.session_state[mode_key] = False
             st.rerun()
+    if skip_key:
+        with cols[2]:
+            if st.button(skip_label, use_container_width=True, key=f"{mode_key}_skip"):
+                if direct_text.strip():
+                    for k in (also_clear or []):
+                        st.session_state.pop(k, None)
+                    st.session_state[session_key] = direct_text
+                    st.session_state[skip_key] = direct_text
+                    st.session_state[mode_key] = False
+                    st.rerun()
 
 
 def render_english_audio_generation(voices: dict, tts_model: str, max_chunk_chars: int,
