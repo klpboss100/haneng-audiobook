@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 config_haneng.json
+progress_ko.pkl
+progress_en.pkl
+progress_en_chunks/
+progress_en_meta.pkl
